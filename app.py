@@ -1,9 +1,17 @@
 import os
+import io
 import base64
 import traceback
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
+from PIL import Image, ImageOps
+
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except Exception:
+    pass
 
 load_dotenv()
 
@@ -20,7 +28,7 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 
 # ── Supported file types & Limits ───────────────────────────────────────
-IMAGE_TYPES = ["png", "jpg", "jpeg", "gif", "webp"]
+IMAGE_TYPES = ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff"]
 TEXT_TYPES = [
     "txt", "md", "csv", "json", "xml", "html", "css", "js",
     "ts", "py", "java", "c", "cpp", "h", "rb", "go", "rs",
@@ -31,7 +39,29 @@ DOC_TYPES = ["pdf"]
 MAX_FILE_CHARS = 25000  # Cap extracted text per file to protect API tokens (~5-6k tokens)
 
 
-def _encode_image(file_bytes: bytes, mime: str) -> dict:
+def _normalize_image(file_bytes: bytes) -> tuple[bytes, str]:
+    """
+    Normalize any uploaded image (iOS HEIC, Android JPG, PNG, WebP, etc.).
+    - Fixes mobile camera EXIF orientation so images are never sideways.
+    - Scales down large camera photos (max 2048px) to reduce mobile data & token costs.
+    - Converts to standard RGB JPEG supported natively by OpenAI.
+    """
+    try:
+        im = Image.open(io.BytesIO(file_bytes))
+        im = ImageOps.exif_transpose(im)
+        max_dim = 2048
+        if max(im.size) > max_dim:
+            im.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=85, optimize=True)
+        return out.getvalue(), "image/jpeg"
+    except Exception:
+        return file_bytes, "image/jpeg"
+
+
+def _encode_image(file_bytes: bytes, mime: str = "image/jpeg") -> dict:
     """Build an input_image content block for the Responses API with required detail."""
     b64 = base64.b64encode(file_bytes).decode("utf-8")
     return {
@@ -43,13 +73,13 @@ def _encode_image(file_bytes: bytes, mime: str) -> dict:
 
 def _extract_text(uploaded_file) -> str | None:
     """Extract readable text from an uploaded file with safety length cap."""
-    name = uploaded_file.name.lower()
+    name = getattr(uploaded_file, "name", "").lower()
     raw = uploaded_file.read()
 
     text = ""
     if name.endswith(".pdf"):
         try:
-            import PyPDF2, io
+            import PyPDF2
             reader = PyPDF2.PdfReader(io.BytesIO(raw))
             pages = [p.extract_text() or "" for p in reader.pages]
             text = "\n\n".join(pages).strip()
@@ -74,7 +104,7 @@ def _build_input_messages(messages: list) -> list:
     for m in messages:
         role = m["role"]
         # For assistant messages with images, provide text context
-        if m.get("_generated_image"):
+        if m.get("_generated_images"):
             content_text = m.get("content") or "[Generated an image]"
             history.append({"role": role, "content": content_text})
             continue
@@ -163,24 +193,11 @@ with st.sidebar:
         st.info(f"📊 **Session Tokens Used:** {st.session_state.total_tokens_used:,}")
 
     st.divider()
-    st.header("📎 Attach Files & Images")
-    all_types = IMAGE_TYPES + TEXT_TYPES + DOC_TYPES
-    uploaded_files = st.file_uploader(
-        "Attach to next message",
-        type=all_types,
-        accept_multiple_files=True,
-        key=f"file_uploader_{st.session_state.uploader_key}",
-        help="Attached files are sent with your next prompt and extracted safely to conserve tokens."
-    )
-
-    if uploaded_files:
-        st.success(f"{len(uploaded_files)} file(s) attached — type your message below.")
-
-    st.divider()
     st.caption("**Supported formats:**")
-    st.caption(f"🖼️ Images: {', '.join(IMAGE_TYPES)}")
-    st.caption(f"📄 Code/Text: {', '.join(TEXT_TYPES)}")
-    st.caption(f"📕 Documents: {', '.join(DOC_TYPES)}")
+    st.caption("🖼️ Photos / Images: HEIC, PNG, JPG, JPEG, WebP, GIF, BMP")
+    st.caption("📸 Live Camera Capture on Mobile")
+    st.caption("📄 Code/Text: py, js, txt, csv, json, md, etc.")
+    st.caption("📕 Documents: PDF")
 
 # ── Render chat history ─────────────────────────────────────────────────
 for msg in st.session_state.messages:
@@ -188,7 +205,7 @@ for msg in st.session_state.messages:
         # Show attached images if present
         if msg.get("_attached_images"):
             for img_bytes, fname in msg["_attached_images"]:
-                st.image(img_bytes, caption=fname, width=350)
+                st.image(img_bytes, caption=fname, use_container_width=True)
 
         # Show attached text files in expander
         if msg.get("_attached_texts"):
@@ -204,34 +221,65 @@ for msg in st.session_state.messages:
         if msg.get("_generated_images"):
             for img_item in msg["_generated_images"]:
                 if isinstance(img_item, dict):
-                    st.image(img_item["bytes"], caption=img_item.get("revised_prompt"))
+                    st.image(img_item["bytes"], caption=img_item.get("revised_prompt"), use_container_width=True)
                 else:
-                    st.image(img_item)
+                    st.image(img_item, use_container_width=True)
 
         # Show token badge
         if msg.get("_tokens"):
             t = msg["_tokens"]
             st.caption(f"⚡ Tokens: {t['input_tokens']:,} in · {t['output_tokens']:,} out")
 
+# ── Mobile-friendly Attachment Expander directly in the main view ────────
+all_supported_types = IMAGE_TYPES + TEXT_TYPES + DOC_TYPES
+with st.expander("📎 Attach Photos / Camera / Files", expanded=False):
+    tab_upload, tab_cam = st.tabs(["📁 Photo Gallery / Files", "📸 Take Photo"])
+    with tab_upload:
+        uploaded_files = st.file_uploader(
+            "Select photo or file from your device",
+            type=all_supported_types,
+            accept_multiple_files=True,
+            key=f"file_uploader_{st.session_state.uploader_key}",
+            help="Supports iPhone/Android photos (including HEIC), camera uploads, PDFs, and code files.",
+        )
+    with tab_cam:
+        camera_photo = st.camera_input(
+            "Capture with phone camera",
+            key=f"camera_{st.session_state.uploader_key}",
+        )
+
+# Gather all attachments
+active_attachments = []
+if uploaded_files:
+    active_attachments.extend(uploaded_files)
+if camera_photo:
+    active_attachments.append(camera_photo)
+
+if active_attachments:
+    st.info(f"✅ {len(active_attachments)} attachment(s) ready. Type your prompt below and tap send.")
+
 # ── Chat input ──────────────────────────────────────────────────────────
 if prompt := st.chat_input("Type a message or ask to generate an image…"):
-
-    current_files = list(uploaded_files) if uploaded_files else []
 
     attached_images = []   # (bytes, filename, mime)
     attached_texts = []    # (filename, extracted_text)
 
-    for f in current_files:
-        ext = f.name.rsplit(".", 1)[-1].lower() if "." in f.name else ""
-        if ext in IMAGE_TYPES:
-            mime = f.type or f"image/{ext}"
+    for f in active_attachments:
+        fname = getattr(f, "name", "camera_photo.jpg")
+        ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+        mime = getattr(f, "type", "") or ""
+
+        # Check if file is an image (including iOS camera, HEIC, or camera widget)
+        if ext in IMAGE_TYPES or mime.startswith("image/") or "camera" in fname.lower():
             f.seek(0)
-            attached_images.append((f.read(), f.name, mime))
+            raw_bytes = f.read()
+            normalized_bytes, normalized_mime = _normalize_image(raw_bytes)
+            attached_images.append((normalized_bytes, fname, normalized_mime))
         else:
             f.seek(0)
             text = _extract_text(f)
             if text:
-                attached_texts.append((f.name, text))
+                attached_texts.append((fname, text))
 
     # Prepare user message for session display
     user_msg: dict = {"role": "user", "content": prompt}
@@ -267,15 +315,15 @@ if prompt := st.chat_input("Type a message or ask to generate an image…"):
     with st.chat_message("user"):
         if attached_images:
             for img_bytes, fname, _ in attached_images:
-                st.image(img_bytes, caption=fname, width=350)
+                st.image(img_bytes, caption=fname, use_container_width=True)
         if attached_texts:
             for fname, text in attached_texts:
                 with st.expander(f"📄 {fname}"):
                     st.code(text[:2000], language=None)
         st.markdown(prompt)
 
-    # Reset file uploader for subsequent turns so attachments aren't duplicated
-    if current_files:
+    # Reset attachment widget keys for subsequent turns
+    if active_attachments:
         st.session_state.uploader_key += 1
 
     # Call OpenAI Responses API
@@ -305,7 +353,7 @@ if prompt := st.chat_input("Type a message or ask to generate an image…"):
                     st.markdown(text_resp)
 
                 for img_item in gen_images:
-                    st.image(img_item["bytes"], caption=img_item.get("revised_prompt"))
+                    st.image(img_item["bytes"], caption=img_item.get("revised_prompt"), use_container_width=True)
 
                 if usage:
                     st.session_state.total_tokens_used += usage["total_tokens"]
